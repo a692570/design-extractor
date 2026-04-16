@@ -75,11 +75,13 @@ Structure:
 
 ## Install
 
-1. Clone this repo
+Not on the Web Store yet. Takes 30 seconds to sideload:
+
+1. [Download the latest release](https://github.com/a692570/design-extractor/releases/latest) and unzip it
 2. Open `chrome://extensions` (or `edge://extensions`)
-3. Enable **Developer mode**
-4. Click **Load unpacked** and select this folder
-5. Navigate to any site, click the extension icon, hit **Extract Design System**
+3. Toggle **Developer mode** on (top right)
+4. Click **Load unpacked** and select the unzipped folder
+5. Navigate to any site and click the extension icon
 
 ## What it extracts vs what it misses
 
