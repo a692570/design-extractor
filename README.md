@@ -1,6 +1,6 @@
 # Design System Extractor
 
-A Chrome extension that reverse-engineers any website's design system in one click — CSS tokens, component structure, computed styles, and keyframe animations — and packages everything into a single markdown file you can feed to an AI to rebuild the UI.
+A Chrome extension that reverse-engineers any website's design system in one click: CSS tokens, component structure, computed styles, and keyframe animations, packaged into a single markdown file you can feed to an AI to rebuild the UI.
 
 ## What it does
 
@@ -12,8 +12,8 @@ Most design cloning tools scrape colors from screenshots. This reads the actual 
 
 | Layer | What it extracts | Why it matters |
 |-------|-----------------|----------------|
-| CSS Custom Properties | `:root` variables — the actual design tokens | Modern sites store their entire system in `--color-primary`, `--spacing-lg`, etc. Computed styles miss these. |
-| Stylesheet walking | Raw CSS before browser resolution | Gets `rem`, `var()`, `clamp()` originals — not resolved pixels |
+| CSS Custom Properties | `:root` variables (the actual design tokens) | Modern sites store their entire system in `--color-primary`, `--spacing-lg`, etc. Computed styles miss these. |
+| Stylesheet walking | Raw CSS before browser resolution | Gets `rem`, `var()`, `clamp()` originals, not resolved pixels |
 | Component HTML | Skeletonized nav, hero, cards, footer | The token colors don't tell you *where* to put them |
 | Computed styles | `getComputedStyle()` on real DOM elements | Works on CDN-hosted CSS (Webflow, Framer, etc.) where stylesheet walking fails |
 | Keyframe animations | `@keyframes` rules from all sheets | Captures entrance animations, shimmer effects, transitions |
@@ -28,7 +28,7 @@ The extension was run on [anthropic.com](https://anthropic.com), producing a sin
 |----------|--------------------------|
 | ![Anthropic.com](original-screenshot.png) | ![Clone](clone-screenshot.png) |
 
-The AI inferred the word-by-word reveal animation from the `.animate-word` class and `opacity/transform` transition values in the extracted styles. The marquee strip came from the `@-webkit-keyframes marquee` rule in the keyframes section. Neither was explicitly described — the data was enough.
+The AI inferred the word-by-word reveal animation from the `.animate-word` class and `opacity/transform` transition values in the extracted styles. The marquee strip came from the `@-webkit-keyframes marquee` rule in the keyframes section. Neither was explicitly described. The data was enough.
 
 ## Output format
 
@@ -105,9 +105,9 @@ The extractor strips CSS variables injected by browser extensions (Speechify, Gr
 
 Manifest V3. No external dependencies. Runs entirely in the browser. Three injected scripts:
 
-- `content-script.js` — samples DOM elements, reads computed styles, collects site signals
-- `runStructureScript` — extracts and skeletonizes component HTML
-- `runStylesScript` — finds CSS rules for component classes via `getComputedStyle()`
+- `content-script.js`: samples DOM elements, reads computed styles, collects site signals
+- `runStructureScript`: extracts and skeletonizes component HTML
+- `runStylesScript`: finds CSS rules for component classes via `getComputedStyle()`
 
 The service worker orchestrates, normalizes, and generates the markdown.
 
