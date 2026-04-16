@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Design System Extractor</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="2" y="2" width="7" height="7" rx="1.5" fill="#6366f1"/>
+          <rect x="11" y="2" width="7" height="7" rx="1.5" fill="#8b5cf6"/>
+          <rect x="2" y="11" width="7" height="7" rx="1.5" fill="#a78bfa"/>
+          <rect x="11" y="11" width="7" height="7" rx="1.5" fill="#c4b5fd"/>
+        </svg>
+      </div>
+      <h1 class="title">Design Extractor</h1>
+    </header>
+
+    <div class="content">
+      <div id="idle-state" class="state">
+        <p class="description">Extract the complete design system from this page — tokens, fonts, spacing, components.</p>
+        <button id="extract-btn" class="btn btn-primary">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M7 1v8M4 6l3 3 3-3M2 11h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Extract Design System
+        </button>
+      </div>
+
+      <div id="loading-state" class="state hidden">
+        <div class="spinner-wrap">
+          <div class="spinner"></div>
+        </div>
+        <p id="loading-msg" class="loading-text">Scanning stylesheets...</p>
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+      </div>
+
+      <div id="result-state" class="state hidden">
+        <div id="framework-badge" class="framework-badge"></div>
+        <div class="stats-grid" id="stats-grid"></div>
+        <div class="actions">
+          <button id="download-btn" class="btn btn-primary">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M7 1v8M4 6l3 3 3-3M2 11h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span id="download-btn-label">Download Design System</span>
+          </button>
+          <button id="copy-btn" class="btn btn-secondary">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="4" y="4" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M2 10V2h8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            Copy All to Clipboard
+          </button>
+        </div>
+        <button id="re-extract-btn" class="btn btn-ghost">Extract Again</button>
+      </div>
+
+      <div id="error-state" class="state hidden">
+        <div class="error-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="12" cy="12" r="9" stroke="#ef4444" stroke-width="1.5"/>
+            <path d="M12 8v4M12 16h.01" stroke="#ef4444" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <p id="error-msg" class="error-text">Extraction failed.</p>
+        <button id="retry-btn" class="btn btn-secondary">Try Again</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
