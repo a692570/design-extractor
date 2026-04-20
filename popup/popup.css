@@ -9,7 +9,7 @@ body {
   font-size: 13px;
   background: #0f0f11;
   color: #e2e8f0;
-  width: 300px;
+  width: 320px;
   min-height: 180px;
 }
 
@@ -161,6 +161,12 @@ body {
 }
 
 /* Result state */
+.badge-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 .framework-badge {
   display: inline-flex;
   align-items: center;
@@ -172,7 +178,6 @@ body {
   font-size: 11px;
   color: #a78bfa;
   font-weight: 500;
-  align-self: flex-start;
 }
 
 .framework-badge::before {
@@ -184,9 +189,21 @@ body {
   flex-shrink: 0;
 }
 
+.brand-color-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: 'SF Mono', Monaco, monospace;
+  border: 1px solid rgba(255,255,255,0.2);
+}
+
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
+  grid-template-columns: repeat(3, 1fr);
   gap: 6px;
 }
 
@@ -198,14 +215,14 @@ body {
 }
 
 .stat-value {
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
   color: #f1f5f9;
   line-height: 1.2;
 }
 
 .stat-label {
-  font-size: 10px;
+  font-size: 9px;
   color: #64748b;
   margin-top: 2px;
   text-transform: uppercase;

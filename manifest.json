@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Design System Extractor",
-  "version": "1.0.0",
-  "description": "Extract design tokens, CSS custom properties, and component patterns from any website.",
+  "version": "2.0.0",
+  "description": "Reverse-engineer any website's design system: CSS tokens with var() resolution, brand color detection, assets, and interactive HTML report.",
   "permissions": [
     "activeTab",
     "scripting",

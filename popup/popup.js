@@ -3,6 +3,7 @@
 const $ = (id) => document.getElementById(id);
 
 let combinedMarkdown = '';
+let htmlReport = '';
 let siteSlug = 'design-system';
 
 function showState(name) {
@@ -21,11 +22,12 @@ function renderStats(summary) {
   grid.innerHTML = '';
 
   const items = [
-    { value: summary.cssVarCount, label: 'CSS Variables' },
+    { value: summary.cssVarCount, label: 'CSS Vars' },
+    { value: `${summary.resolvedCount ?? 0}/${summary.totalVars ?? summary.cssVarCount}`, label: 'Resolved' },
     { value: summary.colorCount, label: 'Colors' },
-    { value: summary.fontCount, label: 'Font Families' },
+    { value: summary.fontCount, label: 'Fonts' },
     { value: summary.componentCount, label: 'Components' },
-    { value: summary.capturedCount || 0, label: 'Captured' },
+    { value: summary.warningCount ?? 0, label: 'Warnings' },
   ];
 
   items.forEach(({ value, label }) => {
@@ -34,19 +36,26 @@ function renderStats(summary) {
     card.innerHTML = `<div class="stat-value">${value}</div><div class="stat-label">${label}</div>`;
     grid.appendChild(card);
   });
+
+  if (summary.brandColor) {
+    const badge = $('brand-color-badge');
+    if (badge) {
+      badge.style.display = 'flex';
+      badge.style.background = summary.brandColor;
+      const lightness = hexLightness(summary.brandColor);
+      badge.style.color = lightness > 55 ? '#000' : '#fff';
+      badge.textContent = summary.brandColor;
+    }
+  }
 }
 
 function slugFromUrl(url) {
   try {
     const hostname = new URL(url).hostname.replace(/^www\./, '');
-    // workers.cloudflare.com → cloudflare-workers
-    // wisprflow.ai → wisprflow
-    // linear.app → linear
     const parts = hostname.split('.');
     const tld = parts[parts.length - 1];
     const known = ['com','io','ai','app','dev','net','org','co','sh','gg','so','is','to'];
     const stripped = known.includes(tld) ? parts.slice(0, -1) : parts.slice(0, -1);
-    // reverse so brand name comes first: workers.cloudflare → cloudflare-workers
     return stripped.reverse().join('-').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
   } catch {
     return 'design-system';
@@ -55,10 +64,10 @@ function slugFromUrl(url) {
 
 function stripHeader(md) {
   return md
-    .replace(/^#[^\n]*\n/, '')           // remove title
-    .replace(/^>[^\n]*\n/gm, '')          // remove > Extracted lines
-    .replace(/^<!--[\s\S]*?-->\n?/gm, '') // remove <!-- comments -->
-    .replace(/\n## Using This File[\s\S]*/, '') // remove trailing "Using This File" section
+    .replace(/^#[^\n]*\n/, '')
+    .replace(/^>[^\n]*\n/gm, '')
+    .replace(/^<!--[\s\S]*?-->\n?/gm, '')
+    .replace(/\n## Using This File[\s\S]*/, '')
     .replace(/^\n+/, '')
     .trim();
 }
@@ -86,7 +95,6 @@ async function runExtraction() {
     return;
   }
 
-  // Set up message listener before triggering extraction
   const resultPromise = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       chrome.runtime.onMessage.removeListener(handler);
@@ -109,7 +117,6 @@ async function runExtraction() {
     chrome.runtime.onMessage.addListener(handler);
   });
 
-  // Trigger extraction in service worker
   chrome.runtime.sendMessage({ type: 'EXTRACT', tabId: tab.id, tabUrl: tab.url });
 
   try {
@@ -122,14 +129,13 @@ async function runExtraction() {
       tab.url,
       siteSlug
     );
+    htmlReport = result.htmlReport || '';
 
-    // Update download button label with site slug
     const label = $('download-btn-label');
     if (label) label.textContent = `Download ${siteSlug}-design-system.md`;
 
-    // Render framework badge
-    const badge = $('framework-badge');
-    badge.textContent = result.summary.framework || 'Custom Design System';
+    const frameworkBadge = $('framework-badge');
+    frameworkBadge.textContent = result.summary.framework || 'Custom Design System';
 
     renderStats(result.summary);
     showState('result');
@@ -154,6 +160,17 @@ async function downloadMarkdown() {
   URL.revokeObjectURL(url);
 }
 
+async function downloadHtmlReport() {
+  if (!htmlReport) return;
+  const blob = new Blob([htmlReport], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${siteSlug}-design-report.html`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 async function copyToClipboard() {
   if (!combinedMarkdown) return;
   try {
@@ -169,14 +186,23 @@ async function copyToClipboard() {
       </svg> Copy to Clipboard`;
     }, 2000);
   } catch {
-    // Clipboard API may fail if popup loses focus
     showError('Clipboard write failed. Try downloading instead.');
   }
 }
 
-// Event bindings
+function hexLightness(hex) {
+  if (!hex || !hex.startsWith('#')) return 50;
+  const h = hex.replace('#', '');
+  if (h.length < 6) return 50;
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return (Math.max(r, g, b) + Math.min(r, g, b)) / 2 / 255 * 100;
+}
+
 $('extract-btn').addEventListener('click', runExtraction);
 $('retry-btn').addEventListener('click', () => { showState('idle'); });
-$('re-extract-btn').addEventListener('click', () => { combinedMarkdown = ''; siteSlug = 'design-system'; runExtraction(); });
+$('re-extract-btn').addEventListener('click', () => { combinedMarkdown = ''; htmlReport = ''; siteSlug = 'design-system'; runExtraction(); });
 $('download-btn').addEventListener('click', downloadMarkdown);
+$('download-html-btn').addEventListener('click', downloadHtmlReport);
 $('copy-btn').addEventListener('click', copyToClipboard);

@@ -1,30 +1,30 @@
-// Service worker (MV3) — orchestrates injection, receives data, generates DESIGN.md + STRUCTURE.md
+// Service worker (MV3) — orchestrates injection, receives data, generates all outputs
 // Uses ES module imports (manifest declares "type": "module")
 
 import { generateDesignMd } from './lib/generate-design-md.js';
 import { generateStructureMd } from './lib/generate-structure-md.js';
 import { generateStylesMd } from './lib/generate-styles-md.js';
+import { resolveCssVarsMap } from './lib/var-resolver.js';
+import { detectBrandColors, detectPitfalls } from './lib/brand-colors.js';
+import { generateHtmlReport } from './lib/generate-html-report.js';
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'EXTRACT') {
     handleExtraction(message.tabId, message.tabUrl);
-    return false; // response is async via separate messages
+    return false;
   }
 });
 
 async function sendProgress(pct, msg) {
   try {
     await chrome.runtime.sendMessage({ type: 'EXTRACTION_PROGRESS', pct, msg });
-  } catch (_e) {
-    // Popup may have closed
-  }
+  } catch (_e) {}
 }
 
 async function handleExtraction(tabId, tabUrl) {
   try {
-    await sendProgress(10, 'Injecting extraction script...');
+    await sendProgress(5, 'Injecting extraction script...');
 
-    // Inject the design tokens content script and get the result back
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       func: runContentScript,
@@ -39,14 +39,44 @@ async function handleExtraction(tabId, tabUrl) {
       throw new Error('Content script returned null — page may be restricted (chrome://, about:, etc.).');
     }
 
-    await sendProgress(50, 'Processing design tokens...');
+    await sendProgress(25, 'Resolving var() chains...');
 
-    // Validate and normalize data
     const normalized = normalizeData(data);
+
+    const resolvedMap = resolveCssVarsMap(normalized.cssVars);
+
+    await sendProgress(40, 'Detecting brand colors...');
+
+    const allCssText = buildAllCssText(normalized.cssVars);
+
+    const brandColors = detectBrandColors(
+      normalized.cssVars,
+      resolvedMap.vars,
+      allCssText,
+      data.htmlSnapshot || ''
+    );
+
+    await sendProgress(50, 'Running pitfall detection...');
+
+    const warnings = detectPitfalls(normalized.cssVars, normalized.fonts, normalized.stylesheetData);
+
+    await sendProgress(55, 'Extracting assets...');
+
+    let assets = {};
+    try {
+      const assetResults = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: runAssetScript,
+      });
+      if (assetResults && assetResults[0] && assetResults[0].result) {
+        assets = assetResults[0].result;
+      }
+    } catch (e) {
+      console.warn('[Design Extractor] Asset extraction failed (non-fatal):', e);
+    }
 
     await sendProgress(65, 'Capturing component structure...');
 
-    // Inject the structure extraction script
     let structureComponents = {};
     try {
       const structureResults = await chrome.scripting.executeScript({
@@ -62,7 +92,6 @@ async function handleExtraction(tabId, tabUrl) {
 
     await sendProgress(75, 'Extracting component CSS rules...');
 
-    // Inject the styles extraction script — must run after structure so we know the class names
     let cssRules = {};
     try {
       const stylesResults = await chrome.scripting.executeScript({
@@ -79,21 +108,26 @@ async function handleExtraction(tabId, tabUrl) {
 
     await sendProgress(82, 'Generating DESIGN.md...');
 
-    // Generate design markdown
-    const markdown = generateDesignMd(normalized);
+    const enrichedData = {
+      ...normalized,
+      resolvedMap,
+      brandColors,
+      warnings,
+      assets,
+    };
+
+    const markdown = generateDesignMd(enrichedData);
 
     await sendProgress(90, 'Generating STRUCTURE.md...');
 
-    // Generate structure markdown
     const structureData = {
       meta: normalized.meta,
       components: structureComponents,
     };
     const { markdown: structureMarkdown, capturedCount } = generateStructureMd(structureData);
 
-    await sendProgress(95, 'Generating STYLES.md...');
+    await sendProgress(93, 'Generating STYLES.md...');
 
-    // Generate styles markdown
     const stylesData = {
       meta: normalized.meta,
       components: structureComponents,
@@ -102,16 +136,20 @@ async function handleExtraction(tabId, tabUrl) {
     };
     const stylesMarkdown = generateStylesMd(stylesData);
 
+    await sendProgress(96, 'Generating HTML report...');
+
+    const htmlReport = generateHtmlReport(enrichedData);
+
     await sendProgress(98, 'Done!');
 
-    // Build summary for popup stats
-    const summary = buildSummary(normalized, capturedCount);
+    const summary = buildSummary(normalized, capturedCount, resolvedMap, brandColors, warnings);
 
     await chrome.runtime.sendMessage({
       type: 'EXTRACTION_COMPLETE',
       markdown,
       structureMarkdown,
       stylesMarkdown,
+      htmlReport,
       summary,
     });
 
@@ -126,8 +164,13 @@ async function handleExtraction(tabId, tabUrl) {
   }
 }
 
+function buildAllCssText(cssVars) {
+  return Object.entries(cssVars)
+    .map(([name, data]) => `${name}: ${data.value || ''};`)
+    .join('\n');
+}
+
 // This function runs inside the page context (not service worker)
-// It's serialized as a string and injected via executeScript
 function runContentScript() {
   'use strict';
 
@@ -139,9 +182,7 @@ function runContentScript() {
     for (const sheet of document.styleSheets) {
       try {
         walkRules(sheet.cssRules, vars, sheet.href || 'inline');
-      } catch (_e) {
-        // Cross-origin sheet
-      }
+      } catch (_e) {}
     }
 
     const rootComputed = getComputedStyle(document.documentElement);
@@ -169,7 +210,6 @@ function runContentScript() {
       }
     }
 
-    // Filter out CSS vars injected by browser extensions (not the page's design system)
     const EXTENSION_PREFIXES = [
       '--speechify-', '--grammarly-', '--__ext-', '--loom-', '--honey-',
       '--dashlane-', '--lastpass-', '--1password-', '--bitwarden-',
@@ -214,15 +254,12 @@ function runContentScript() {
         for (const rule of sheet.cssRules) {
           collectKeyframes(rule, keyframes);
         }
-      } catch (_e) {
-        // cross-origin sheet
-      }
+      } catch (_e) {}
     }
     return keyframes;
   }
 
   function collectKeyframes(rule, keyframes) {
-    // CSSKeyframesRule.type === 7
     if (rule.type === 7) {
       const name = rule.name;
       if (name && !keyframes[name]) {
@@ -230,7 +267,6 @@ function runContentScript() {
       }
       return;
     }
-    // recurse into @media, @layer, @supports
     if (rule.cssRules) {
       for (const child of rule.cssRules) {
         collectKeyframes(child, keyframes);
@@ -530,6 +566,16 @@ function runContentScript() {
     return { colors, typography, spacing, radius, shadow, animation, zIndex, breakpoints, other };
   }
 
+  // ─── HTML SNAPSHOT (for brand color analysis) ─────────────────────────────
+
+  function captureHtmlSnapshot() {
+    try {
+      return document.documentElement.outerHTML.slice(0, 500000);
+    } catch (_e) {
+      return '';
+    }
+  }
+
   // ─── MAIN ─────────────────────────────────────────────────────────────────
 
   const cssVars = extractCSSVars();
@@ -557,11 +603,73 @@ function runContentScript() {
     fonts,
     components,
     spacing,
+    htmlSnapshot: captureHtmlSnapshot(),
   };
 }
 
+// ─── ASSET EXTRACTION SCRIPT ─────────────────────────────────────────────────
+function runAssetScript() {
+  'use strict';
+
+  const images = [];
+  const svgs = [];
+  const icons = [];
+  const seen = new Set();
+
+  document.querySelectorAll('img').forEach(el => {
+    const src = el.currentSrc || el.src;
+    if (!src || seen.has(src) || src.startsWith('data:')) return;
+    seen.add(src);
+    const r = el.getBoundingClientRect();
+    images.push({ src, alt: el.alt || '', width: el.naturalWidth || r.width, height: el.naturalHeight || r.height, visible: r.width > 0 && r.height > 0 });
+  });
+
+  document.querySelectorAll('picture source').forEach(el => {
+    const srcset = el.srcset;
+    if (!srcset) return;
+    srcset.split(',').forEach(entry => {
+      const url = entry.trim().split(/\s+/)[0];
+      if (url && !seen.has(url) && !url.startsWith('data:')) {
+        seen.add(url);
+        images.push({ src: url, alt: '', width: 0, height: 0, visible: true });
+      }
+    });
+  });
+
+  document.querySelectorAll('svg').forEach(el => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return;
+    const html = el.outerHTML;
+    const hash = html.length.toString(36) + html.slice(0, 40).replace(/\s+/g, '').length.toString(36);
+    if (seen.has('svg:' + hash)) return;
+    seen.add('svg:' + hash);
+    const isIcon = r.width <= 48 && r.height <= 48;
+    const entry = { html: html.length > 2000 ? html.slice(0, 2000) + '...' : html, width: Math.round(r.width), height: Math.round(r.height), viewBox: el.getAttribute('viewBox') || '', isIcon };
+    svgs.push(entry);
+    if (isIcon) icons.push(entry);
+  });
+
+  document.querySelectorAll('link[rel*="icon"], link[rel="apple-touch-icon"], link[rel="mask-icon"]').forEach(el => {
+    const href = el.href;
+    if (!href || seen.has(href)) return;
+    seen.add(href);
+    icons.push({ src: href, rel: el.rel, sizes: el.getAttribute('sizes') || '', type: el.type || '' });
+  });
+
+  const logoCandidates = [];
+  document.querySelectorAll('header a, [role="banner"] a, nav:first-of-type a').forEach(el => {
+    const img = el.querySelector('img, svg');
+    if (!img) return;
+    const r = img.getBoundingClientRect();
+    if (r.width < 20 || r.height < 10 || r.width > 600) return;
+    const isSvg = img.tagName === 'SVG';
+    logoCandidates.push({ tag: img.tagName.toLowerCase(), src: isSvg ? '' : (img.currentSrc || img.src || ''), svgHtml: isSvg ? img.outerHTML.slice(0, 3000) : '', width: Math.round(r.width), height: Math.round(r.height), alt: img.alt || '' });
+  });
+
+  return { images: images.slice(0, 50), svgs: svgs.slice(0, 30), icons: icons.slice(0, 30), logo: logoCandidates[0] || null };
+}
+
 function normalizeData(data) {
-  // Ensure all expected keys are present even if content script returned partials
   return {
     meta: data.meta || { title: '', url: '', hostname: 'unknown', viewport: '', darkMode: false, timestamp: new Date().toISOString() },
     cssVars: data.cssVars || {},
@@ -572,15 +680,15 @@ function normalizeData(data) {
     components: data.components || { buttons: [], dialogs: [], forms: [], navs: [], cards: [], alerts: [], tables: [], inputs: [], badges: [], dropdowns: [] },
     spacing: data.spacing || { detectedValues: [], spacingVars: [] },
     keyframes: data.keyframes || {},
+    htmlSnapshot: data.htmlSnapshot || '',
   };
 }
 
-function buildSummary(data, capturedCount = 0) {
+function buildSummary(data, capturedCount, resolvedMap, brandColors, warnings) {
   const cssVarCount = Object.keys(data.cssVars).length;
   const colorCount = Object.keys(data.classified.colors).length;
   const loadedFamilies = [...new Set(data.fonts.loaded.map(f => f.family))];
   const fontCount = loadedFamilies.length || data.fonts.googleFonts.length || data.fonts.declaredFamilies.length;
-
   const componentCount = Object.values(data.components).reduce((sum, arr) => sum + arr.length, 0);
 
   return {
@@ -590,253 +698,100 @@ function buildSummary(data, capturedCount = 0) {
     componentCount,
     capturedCount,
     framework: data.framework.primary,
+    resolvedCount: resolvedMap ? resolvedMap.resolvedCount : 0,
+    totalVars: resolvedMap ? resolvedMap.totalVars : cssVarCount,
+    brandColor: brandColors ? brandColors.brandColor : null,
+    warningCount: warnings ? warnings.length : 0,
   };
 }
 
 // ─── STRUCTURE EXTRACTION SCRIPT ─────────────────────────────────────────────
-// This function runs inside the page context (not service worker)
-// It's serialized as a string and injected via executeScript
 function runStructureScript() {
   'use strict';
 
   const MAX_DEPTH = 6;
 
-  // ─── SKELETONIZATION ───────────────────────────────────────────────────────
-
   function skeletonize(el, depth) {
     if (depth > MAX_DEPTH) return null;
-
-    // Skip script and style tags entirely
     const tag = el.tagName.toLowerCase();
     if (tag === 'script' || tag === 'style') return null;
+    if (tag === 'iframe') { try { void el.contentDocument; } catch (_e) { return null; } }
 
-    // Skip cross-origin iframes gracefully
-    if (tag === 'iframe') {
-      try {
-        // Access check — throws on cross-origin
-        void el.contentDocument;
-      } catch (_e) {
-        return null;
-      }
-    }
-
-    // Build the output element: tag + allowed attributes
     const attrs = [];
-    // Attributes to keep verbatim
     const KEEP_ATTRS = new Set(['class', 'id', 'role', 'type', 'aria-label', 'aria-expanded',
       'aria-haspopup', 'aria-controls', 'aria-current', 'aria-selected', 'aria-hidden',
       'aria-labelledby', 'aria-describedby', 'tabindex', 'for', 'name', 'method']);
-    // Attributes to replace with [URL]
     const URL_ATTRS = new Set(['href', 'src', 'action']);
 
     for (const attr of el.attributes) {
       const name = attr.name;
-      if (KEEP_ATTRS.has(name)) {
-        attrs.push(`${name}="${escapeAttr(attr.value)}"`);
-      } else if (URL_ATTRS.has(name)) {
-        attrs.push(`${name}="[URL]"`);
-      } else if (name === 'placeholder') {
-        attrs.push(`placeholder="[TEXT]"`);
-      } else if (name === 'alt') {
-        attrs.push(`alt="[TEXT]"`);
-      }
-      // style, data-*, and all other attributes are stripped
+      if (KEEP_ATTRS.has(name)) { attrs.push(`${name}="${escapeAttr(attr.value)}"`); }
+      else if (URL_ATTRS.has(name)) { attrs.push(`${name}="[URL]"`); }
+      else if (name === 'placeholder') { attrs.push(`placeholder="[TEXT]"`); }
+      else if (name === 'alt') { attrs.push(`alt="[TEXT]"`); }
     }
 
     const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';
+    const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+    if (VOID_TAGS.has(tag)) return `<${tag}${attrStr}>`;
 
-    // Self-closing void elements
-    const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
-      'link', 'meta', 'param', 'source', 'track', 'wbr']);
-    if (VOID_TAGS.has(tag)) {
-      return `<${tag}${attrStr}>`;
-    }
-
-    // Process children
     const childParts = [];
     let hasTextChild = false;
-
     for (const child of el.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE) {
-        const text = child.textContent.trim();
-        if (text) {
-          hasTextChild = true;
-        }
-      } else if (child.nodeType === Node.ELEMENT_NODE) {
-        const childHtml = skeletonize(child, depth + 1);
-        if (childHtml !== null) {
-          childParts.push(childHtml);
-        }
-      }
+      if (child.nodeType === Node.TEXT_NODE) { if (child.textContent.trim()) hasTextChild = true; }
+      else if (child.nodeType === Node.ELEMENT_NODE) { const h = skeletonize(child, depth + 1); if (h !== null) childParts.push(h); }
     }
-
-    // Add [TEXT] placeholder if there were text nodes and no block children
-    if (hasTextChild && childParts.length === 0) {
-      childParts.push('[TEXT]');
-    } else if (hasTextChild) {
-      // If mixed (text + elements), prepend [TEXT] only if the text is meaningful
-      // (e.g., button with both text and icon)
-      // Check if any direct text node is significant
-      const directText = Array.from(el.childNodes)
-        .filter(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim())
-        .length > 0;
-      if (directText) childParts.unshift('[TEXT]');
-    }
-
-    if (childParts.length === 0) {
-      return `<${tag}${attrStr}></${tag}>`;
-    }
-
-    // Indent children
-    const innerLines = childParts
-      .join('\n')
-      .split('\n')
-      .map(line => '  ' + line)
-      .join('\n');
-
+    if (hasTextChild && childParts.length === 0) childParts.push('[TEXT]');
+    else if (hasTextChild) { const dt = Array.from(el.childNodes).filter(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim()).length > 0; if (dt) childParts.unshift('[TEXT]'); }
+    if (childParts.length === 0) return `<${tag}${attrStr}></${tag}>`;
+    const innerLines = childParts.join('\n').split('\n').map(line => '  ' + line).join('\n');
     return `<${tag}${attrStr}>\n${innerLines}\n</${tag}>`;
   }
 
-  function escapeAttr(val) {
-    return val.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  }
+  function escapeAttr(val) { return val.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
-  function captureElement(el) {
-    if (!el) return null;
-    try {
-      return skeletonize(el, 0);
-    } catch (_e) {
-      return null;
-    }
-  }
-
-  // ─── COMPONENT SELECTORS ──────────────────────────────────────────────────
+  function captureElement(el) { if (!el) return null; try { return skeletonize(el, 0); } catch (_e) { return null; } }
 
   function findNav() {
-    // Prefer explicit nav/role="navigation" that's in the header area
-    const candidates = [
-      document.querySelector('header nav'),
-      document.querySelector('nav[role="navigation"]'),
-      document.querySelector('[role="navigation"]'),
-      document.querySelector('nav'),
-      document.querySelector('header'),
-    ];
-    for (const el of candidates) {
-      if (el) return el;
-    }
+    const candidates = [document.querySelector('header nav'), document.querySelector('nav[role="navigation"]'), document.querySelector('[role="navigation"]'), document.querySelector('nav'), document.querySelector('header')];
+    for (const el of candidates) { if (el) return el; }
     return null;
   }
 
   function findHero() {
-    // Element containing the first h1
     const h1 = document.querySelector('h1');
-    if (h1) {
-      // Walk up to find a meaningful section container (section, main > *, div with role, etc.)
-      let el = h1.parentElement;
-      while (el && el !== document.body) {
-        const tag = el.tagName.toLowerCase();
-        if (tag === 'section' || tag === 'main' || el.getAttribute('role') === 'main') {
-          return el;
-        }
-        // Stop at a div that has some substance (multiple children)
-        if (tag === 'div' && el.children.length >= 2) {
-          return el;
-        }
-        el = el.parentElement;
-      }
-      // Fallback: return h1's immediate parent
-      return h1.parentElement;
-    }
-
-    // No h1: try first section or main > *:first-child
-    const firstSection = document.querySelector('main > *:first-child') || document.querySelector('section');
-    return firstSection || null;
+    if (h1) { let el = h1.parentElement; while (el && el !== document.body) { const tag = el.tagName.toLowerCase(); if (tag === 'section' || tag === 'main' || el.getAttribute('role') === 'main') return el; if (tag === 'div' && el.children.length >= 2) return el; el = el.parentElement; } return h1.parentElement; }
+    return document.querySelector('main > *:first-child') || document.querySelector('section') || null;
   }
 
   function findCard() {
-    // Pick one representative card — prefer a card that has some children
-    const selectors = [
-      '[class*="card"]',
-      'article',
-      '[data-slot="card"]',
-    ];
-    for (const sel of selectors) {
-      const cards = document.querySelectorAll(sel);
-      for (const card of cards) {
-        // Skip tiny/empty cards, prefer ones with 2+ children
-        if (card.children.length >= 2) return card;
-      }
-      if (cards.length > 0) return cards[0];
-    }
+    for (const sel of ['[class*="card"]', 'article', '[data-slot="card"]']) { const cards = document.querySelectorAll(sel); for (const card of cards) { if (card.children.length >= 2) return card; } if (cards.length > 0) return cards[0]; }
     return null;
   }
 
   function findCTA() {
-    // Primary CTA: prefer buttons with primary/cta class names, or the first visible button
     const buttons = document.querySelectorAll('button, a[class*="btn"], a[class*="button"]');
     const primaryPat = /primary|cta|hero|action|get-started|signup|sign-up|try|start/i;
-    for (const btn of buttons) {
-      const cls = btn.className.toString();
-      if (primaryPat.test(cls)) return btn;
-    }
-    // Fallback: first visible button
-    for (const btn of buttons) {
-      const r = btn.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0) return btn;
-    }
+    for (const btn of buttons) { if (primaryPat.test(btn.className.toString())) return btn; }
+    for (const btn of buttons) { const r = btn.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return btn; }
     return buttons[0] || null;
   }
 
-  function findFooter() {
-    return document.querySelector('footer') || null;
-  }
-
-  // ─── MAIN ────────────────────────────────────────────────────────────────
+  function findFooter() { return document.querySelector('footer') || null; }
 
   const result = {};
-
-  const nav = findNav();
-  if (nav) {
-    const html = captureElement(nav);
-    if (html) result.nav = html;
-  }
-
-  const hero = findHero();
-  if (hero) {
-    const html = captureElement(hero);
-    if (html) result.hero = html;
-  }
-
-  const card = findCard();
-  if (card) {
-    const html = captureElement(card);
-    if (html) result.card = html;
-  }
-
-  const cta = findCTA();
-  if (cta) {
-    const html = captureElement(cta);
-    if (html) result.cta = html;
-  }
-
-  const footer = findFooter();
-  if (footer) {
-    const html = captureElement(footer);
-    if (html) result.footer = html;
-  }
-
+  const nav = findNav(); if (nav) { const html = captureElement(nav); if (html) result.nav = html; }
+  const hero = findHero(); if (hero) { const html = captureElement(hero); if (html) result.hero = html; }
+  const card = findCard(); if (card) { const html = captureElement(card); if (html) result.card = html; }
+  const cta = findCTA(); if (cta) { const html = captureElement(cta); if (html) result.cta = html; }
+  const footer = findFooter(); if (footer) { const html = captureElement(footer); if (html) result.footer = html; }
   return result;
 }
 
 // ─── STYLES EXTRACTION SCRIPT ────────────────────────────────────────────────
-// This function runs inside the page context (not service worker).
-// It receives the structure components object (sectionKey -> HTML skeleton)
-// and returns a flat rules object { selectorKey -> cssText }.
-// `args` is passed as [structureComponents] via executeScript args.
 function runStylesScript(structureComponents) {
   'use strict';
 
-  // Properties worth capturing for visual reproduction
   const VISUAL_PROPS = [
     'display','position','top','right','bottom','left','z-index',
     'width','height','min-width','max-width','min-height','max-height',
@@ -856,51 +811,31 @@ function runStylesScript(structureComponents) {
 
   function extractClassNamesFromHtml(htmlString) {
     const classNames = new Set();
-    const matches = htmlString.matchAll(/class="([^"]+)"/g);
-    for (const match of matches) {
-      match[1].split(/\s+/).forEach(cls => cls && classNames.add(cls));
-    }
+    for (const match of htmlString.matchAll(/class="([^"]+)"/g)) { match[1].split(/\s+/).forEach(cls => cls && classNames.add(cls)); }
     return classNames;
   }
 
   const allClassNames = new Set();
-  for (const html of Object.values(structureComponents)) {
-    if (html) extractClassNamesFromHtml(html).forEach(c => allClassNames.add(c));
-  }
-
+  for (const html of Object.values(structureComponents)) { if (html) extractClassNamesFromHtml(html).forEach(c => allClassNames.add(c)); }
   if (allClassNames.size === 0) return {};
-
-  // ─── COMPUTED STYLE APPROACH ─────────────────────────────────────────────
-  // Works on any site regardless of CDN/cross-origin CSS.
-  // For each class, find a live DOM element and read getComputedStyle().
 
   const SKIP_VALUES = new Set(['', 'none', 'normal', 'auto', 'initial', 'unset', 'inherit', '0px', 'rgba(0, 0, 0, 0)', 'transparent']);
 
   function getComputedStyleBlock(el) {
     const cs = window.getComputedStyle(el);
     const decls = [];
-    for (const prop of VISUAL_PROPS) {
-      const val = cs.getPropertyValue(prop).trim();
-      if (!val || SKIP_VALUES.has(val)) continue;
-      decls.push(`  ${prop}: ${val};`);
-    }
+    for (const prop of VISUAL_PROPS) { const val = cs.getPropertyValue(prop).trim(); if (!val || SKIP_VALUES.has(val)) continue; decls.push(`  ${prop}: ${val};`); }
     return decls.join('\n');
   }
 
   const result = {};
-
   for (const cls of allClassNames) {
-    // Skip Webflow internal IDs and very generic classes
     if (cls.startsWith('w-node-') || cls === 'w-embed' || cls.length < 3) continue;
-
     const el = document.querySelector(`.${CSS.escape(cls)}`);
     if (!el) continue;
-
     const block = getComputedStyleBlock(el);
     if (!block) continue;
-
     result[cls] = `.${cls} {\n${block}\n}`;
   }
-
   return result;
 }
