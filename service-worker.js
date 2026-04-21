@@ -45,7 +45,22 @@ async function handleExtraction(tabId, tabUrl) {
 
     const resolvedMap = resolveCssVarsMap(normalized.cssVars);
 
-    await sendProgress(40, 'Detecting brand colors...');
+    await sendProgress(38, 'Scanning role colors (CTAs, nav, buttons)...');
+
+    let roleColors = [];
+    try {
+      const roleResults = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: runRoleColorsScript,
+      });
+      if (roleResults && roleResults[0] && roleResults[0].result) {
+        roleColors = roleResults[0].result;
+      }
+    } catch (e) {
+      console.warn('[Design Extractor] Role color scan failed (non-fatal):', e);
+    }
+
+    await sendProgress(42, 'Detecting brand colors...');
 
     const allCssText = buildAllCssText(normalized.cssVars);
 
@@ -53,7 +68,8 @@ async function handleExtraction(tabId, tabUrl) {
       normalized.cssVars,
       resolvedMap.vars,
       allCssText,
-      data.htmlSnapshot || ''
+      data.htmlSnapshot || '',
+      roleColors
     );
 
     await sendProgress(50, 'Running pitfall detection...');
@@ -705,30 +721,122 @@ function buildSummary(data, capturedCount, resolvedMap, brandColors, warnings) {
   };
 }
 
+// ─── ROLE COLORS SCRIPT (page context) ───────────────────────────────────────
+// Harvests computed styles from buttons / CTAs / nav links on the live page.
+// The browser has already resolved var(), rgb(), hsl(), oklch(), color-mix() —
+// so this side-steps every "the regex didn't match" failure mode in CSS-text scans.
+function runRoleColorsScript() {
+  'use strict';
+
+  const PRIMARY_HINT = /(primary|cta|hero|action|get-started|signup|sign-up|try|start|launch|join)/i;
+  const SELECTORS = [
+    'button',
+    'a[class*="btn"]',
+    'a[class*="button"]',
+    'a[class*="cta"]',
+    '[role="button"]',
+    'header a', 'nav a',
+    'input[type="submit"]',
+    'input[type="button"]',
+  ].join(',');
+
+  function inferRole(el) {
+    const cls = (el.className && el.className.toString ? el.className.toString() : '') + ' ' + (el.id || '');
+    if (PRIMARY_HINT.test(cls)) return 'cta';
+    if (el.closest('header,nav')) return 'nav-link';
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'button' || tag === 'input') return 'button';
+    return 'link';
+  }
+
+  const seen = new Set();
+  const results = [];
+
+  for (const el of document.querySelectorAll(SELECTORS)) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 24 || rect.height < 16) continue;     // skip tiny/hidden
+
+    const cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+    if (parseFloat(cs.opacity) < 0.1) continue;
+
+    const bg = cs.backgroundColor;
+    const fg = cs.color;
+    const border = cs.borderColor || cs.borderTopColor || '';
+
+    // Skip elements with no paintable background and no border color — they're text links
+    const bgIsInvisible = !bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent';
+    const borderIsInvisible = !border || border === 'rgba(0, 0, 0, 0)' || border === 'transparent';
+    if (bgIsInvisible && borderIsInvisible) continue;
+
+    const role = inferRole(el);
+    const sampleClass = (el.className && el.className.toString ? el.className.toString() : '')
+      .split(/\s+/).filter(Boolean).slice(0, 3).join('.');
+    const selector = el.tagName.toLowerCase() + (sampleClass ? '.' + sampleClass : '');
+
+    const dedupeKey = `${role}|${bg}|${border}|${fg}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    results.push({
+      role,
+      selector,
+      bg,
+      fg,
+      border,
+      area: Math.round(rect.width * rect.height),
+      hasPrimaryHint: PRIMARY_HINT.test((el.className || '').toString()),
+    });
+
+    if (results.length >= 80) break; // cap
+  }
+
+  return results;
+}
+
 // ─── STRUCTURE EXTRACTION SCRIPT ─────────────────────────────────────────────
 function runStructureScript() {
   'use strict';
 
-  const MAX_DEPTH = 6;
+  const MAX_DEPTH = 10;          // bumped from 6 — modern sites nest sections 7-8 deep
+  const MAX_TEXT_LEN = 240;      // cap individual text nodes so we don't eat whole articles
+  const PRIMARY_HINT = /(primary|cta|hero|action|get-started|signup|sign-up|try|start|launch|join)/i;
+
+  function escapeText(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function captureText(raw) {
+    const t = (raw || '').replace(/\s+/g, ' ').trim();
+    if (!t) return '';
+    if (t.length <= MAX_TEXT_LEN) return escapeText(t);
+    return escapeText(t.slice(0, MAX_TEXT_LEN)) + '…';
+  }
 
   function skeletonize(el, depth) {
     if (depth > MAX_DEPTH) return null;
     const tag = el.tagName.toLowerCase();
-    if (tag === 'script' || tag === 'style') return null;
+    if (tag === 'script' || tag === 'style' || tag === 'noscript') return null;
     if (tag === 'iframe') { try { void el.contentDocument; } catch (_e) { return null; } }
 
     const attrs = [];
     const KEEP_ATTRS = new Set(['class', 'id', 'role', 'type', 'aria-label', 'aria-expanded',
       'aria-haspopup', 'aria-controls', 'aria-current', 'aria-selected', 'aria-hidden',
-      'aria-labelledby', 'aria-describedby', 'tabindex', 'for', 'name', 'method']);
+      'aria-labelledby', 'aria-describedby', 'tabindex', 'for', 'name', 'method', 'alt', 'placeholder']);
     const URL_ATTRS = new Set(['href', 'src', 'action']);
 
     for (const attr of el.attributes) {
       const name = attr.name;
-      if (KEEP_ATTRS.has(name)) { attrs.push(`${name}="${escapeAttr(attr.value)}"`); }
-      else if (URL_ATTRS.has(name)) { attrs.push(`${name}="[URL]"`); }
-      else if (name === 'placeholder') { attrs.push(`placeholder="[TEXT]"`); }
-      else if (name === 'alt') { attrs.push(`alt="[TEXT]"`); }
+      if (KEEP_ATTRS.has(name)) {
+        const v = name === 'class' ? attr.value.split(/\s+/).slice(0, 6).join(' ') : attr.value;
+        attrs.push(`${name}="${escapeAttr(v)}"`);
+      } else if (URL_ATTRS.has(name)) {
+        // Keep same-origin path, strip full URLs (privacy + noise)
+        try {
+          const u = new URL(attr.value, location.origin);
+          attrs.push(`${name}="${escapeAttr(u.pathname || attr.value)}"`);
+        } catch (_e) { attrs.push(`${name}="${escapeAttr(attr.value)}"`); }
+      }
     }
 
     const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';
@@ -736,13 +844,15 @@ function runStructureScript() {
     if (VOID_TAGS.has(tag)) return `<${tag}${attrStr}>`;
 
     const childParts = [];
-    let hasTextChild = false;
     for (const child of el.childNodes) {
-      if (child.nodeType === Node.TEXT_NODE) { if (child.textContent.trim()) hasTextChild = true; }
-      else if (child.nodeType === Node.ELEMENT_NODE) { const h = skeletonize(child, depth + 1); if (h !== null) childParts.push(h); }
+      if (child.nodeType === Node.TEXT_NODE) {
+        const text = captureText(child.textContent);
+        if (text) childParts.push(text);
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        const h = skeletonize(child, depth + 1);
+        if (h !== null) childParts.push(h);
+      }
     }
-    if (hasTextChild && childParts.length === 0) childParts.push('[TEXT]');
-    else if (hasTextChild) { const dt = Array.from(el.childNodes).filter(n => n.nodeType === Node.TEXT_NODE && n.textContent.trim()).length > 0; if (dt) childParts.unshift('[TEXT]'); }
     if (childParts.length === 0) return `<${tag}${attrStr}></${tag}>`;
     const innerLines = childParts.join('\n').split('\n').map(line => '  ' + line).join('\n');
     return `<${tag}${attrStr}>\n${innerLines}\n</${tag}>`;
@@ -771,13 +881,165 @@ function runStructureScript() {
 
   function findCTA() {
     const buttons = document.querySelectorAll('button, a[class*="btn"], a[class*="button"]');
-    const primaryPat = /primary|cta|hero|action|get-started|signup|sign-up|try|start/i;
-    for (const btn of buttons) { if (primaryPat.test(btn.className.toString())) return btn; }
+    for (const btn of buttons) { if (PRIMARY_HINT.test(btn.className.toString())) return btn; }
     for (const btn of buttons) { const r = btn.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return btn; }
     return buttons[0] || null;
   }
 
   function findFooter() { return document.querySelector('footer') || null; }
+
+  // ─── SECTION WALKER ─────────────────────────────────────────────────────────
+  // Walks the top-level children of <main> (or largest content container), emits
+  // one descriptor per section between nav and footer. Classifies layout role by
+  // cheap heuristics. Every section gets a skeleton HTML so recreation has the
+  // shape, AND real text (truncated) so recreation has the copy.
+
+  function shapeSignature(el, d) {
+    if (!el || !el.children || !el.children.length || d <= 0) return el ? el.tagName : '';
+    const childSigs = [];
+    for (let i = 0; i < Math.min(el.children.length, 8); i++) {
+      childSigs.push(shapeSignature(el.children[i], d - 1));
+    }
+    return `${el.tagName}(${childSigs.join(',')})`;
+  }
+
+  function allSameShape(kids) {
+    if (kids.length < 3) return false;
+    const s0 = shapeSignature(kids[0], 2);
+    let matches = 0;
+    for (const k of kids) if (shapeSignature(k, 2) === s0) matches++;
+    return matches / kids.length >= 0.7; // at least 70% match
+  }
+
+  function inferSectionRole(el, kids) {
+    const txt = (el.innerText || '').trim();
+    const imgs = el.querySelectorAll('img, svg');
+    const hasHeading = !!el.querySelector('h2, h3');
+
+    if (imgs.length >= 5 && txt.length < 200) return 'logo-strip';
+    if (el.querySelector('blockquote') || /["""].{30,}["""]/s.test(txt)) return 'testimonial';
+    const bigNums = (txt.match(/\$?[\d,]+[KMB%+](?!\w)/g) || []).length;
+    if (bigNums >= 3 && txt.length < 600) return 'stats-band';
+    if (el.querySelectorAll('[class*="price"],[class*="plan"],[class*="tier"]').length >= 2) return 'pricing';
+    if (el.querySelectorAll('details, [class*="faq"], [class*="accordion"]').length >= 3) return 'faq';
+    // A heading + same-shape children → grid of features (cards)
+    if (kids.length >= 3 && allSameShape(kids) && hasHeading) return 'feature-grid';
+    if (kids.length >= 3 && allSameShape(kids)) return 'card-grid';
+    // A heading + image = single feature split (very common landing-page pattern)
+    if (hasHeading && imgs.length >= 1) return 'feature-section';
+    // No heading but big visible button and a distinct bg → pre-footer CTA band
+    if (!hasHeading && el.querySelector('button, a[class*="btn"], a[class*="cta"]')) {
+      const cs = window.getComputedStyle(el);
+      const bg = cs.backgroundColor;
+      if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') return 'cta-band';
+    }
+    return 'content-block';
+  }
+
+  function inferLayout(el, kids) {
+    const cs = window.getComputedStyle(el);
+    if (cs.display === 'grid') {
+      const cols = (cs.gridTemplateColumns || '').split(/\s+/).filter(Boolean).length;
+      if (cols > 0) return `grid-${cols}`;
+    }
+    if (cs.display === 'flex') {
+      return cs.flexDirection === 'column' ? 'flex-column' : 'flex-row';
+    }
+    if (kids.length > 1) return 'stacked';
+    return 'single';
+  }
+
+  function firstTextOf(el, selector, max = 180) {
+    const hit = el.querySelector(selector);
+    if (!hit) return '';
+    const t = (hit.innerText || '').replace(/\s+/g, ' ').trim();
+    return t.length > max ? t.slice(0, max) + '…' : t;
+  }
+
+  function findMainContainer() {
+    const main = document.querySelector('main') || document.querySelector('[role="main"]');
+    if (main) return main;
+    // Fallback: largest block-level sibling of header/footer
+    const body = document.body;
+    let best = null, bestScore = 0;
+    for (const child of body.children) {
+      const tag = child.tagName.toLowerCase();
+      if (tag === 'header' || tag === 'footer' || tag === 'nav' || tag === 'script') continue;
+      const score = (child.innerText || '').length + child.querySelectorAll('img,svg').length * 50;
+      if (score > bestScore) { best = child; bestScore = score; }
+    }
+    return best || body;
+  }
+
+  // A candidate is "meaningful" if it has its own heading, a distinct background,
+  // or fewer than 2 children. Otherwise it's a generic wrapper and we should
+  // drill into its children to find the real sections.
+  function isGenericWrapper(el, cs) {
+    const hasOwnHeading = !!el.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > header, :scope > [class*="heading"], :scope > [class*="title"]');
+    if (hasOwnHeading) return false;
+
+    const bg = cs.backgroundColor;
+    const hasDistinctBg = bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' && bg !== 'rgb(255, 255, 255)';
+    if (hasDistinctBg) return false;
+
+    const kids = Array.from(el.children);
+    if (kids.length < 2) return false;
+
+    // Has meaningful padding / is acting like a section itself?
+    const pad = cs.padding || '';
+    const bigPad = /\d{2,}px/.test(pad);  // section-like padding is usually >= 48px on one axis
+    if (bigPad && kids.length <= 3) return false;
+
+    return true;
+  }
+
+  function collectSections(el, hero, footer, nav, depth, out) {
+    if (depth > 3) return;             // never drill more than 3 levels
+    if (out.length >= 25) return;
+
+    for (const child of el.children) {
+      if (child === nav || child === footer || child === hero) continue;
+      if (hero && (child.contains(hero) || hero.contains(child))) continue;
+
+      const cs = window.getComputedStyle(child);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const rect = child.getBoundingClientRect();
+      if (rect.height < 80) continue;
+
+      // If this is a pass-through wrapper, drill in instead of emitting it
+      if (isGenericWrapper(child, cs) && child.children.length >= 2) {
+        collectSections(child, hero, footer, nav, depth + 1, out);
+        continue;
+      }
+
+      const kids = Array.from(child.children);
+      const role = inferSectionRole(child, kids);
+      const heading = firstTextOf(child, 'h2, h3, h1');
+      const subhead = firstTextOf(child, 'h2 + p, h3 + p, h1 + p, p', 220);
+      const html = captureElement(child);
+
+      out.push({
+        index: out.length + 1,
+        role,
+        layout: inferLayout(child, kids),
+        bg: cs.backgroundColor,
+        padding: cs.padding,
+        gap: cs.gap,
+        childCount: kids.length,
+        heading,
+        subhead,
+        imageCount: child.querySelectorAll('img, svg').length,
+        html,
+      });
+    }
+  }
+
+  function walkPageSections(nav, footer, hero) {
+    const container = findMainContainer();
+    const sections = [];
+    collectSections(container, hero, footer, nav, 0, sections);
+    return sections;
+  }
 
   const result = {};
   const nav = findNav(); if (nav) { const html = captureElement(nav); if (html) result.nav = html; }
@@ -785,6 +1047,7 @@ function runStructureScript() {
   const card = findCard(); if (card) { const html = captureElement(card); if (html) result.card = html; }
   const cta = findCTA(); if (cta) { const html = captureElement(cta); if (html) result.cta = html; }
   const footer = findFooter(); if (footer) { const html = captureElement(footer); if (html) result.footer = html; }
+  result.sections = walkPageSections(nav, footer, hero);
   return result;
 }
 
@@ -816,7 +1079,17 @@ function runStylesScript(structureComponents) {
   }
 
   const allClassNames = new Set();
-  for (const html of Object.values(structureComponents)) { if (html) extractClassNamesFromHtml(html).forEach(c => allClassNames.add(c)); }
+  function ingestHtml(h) {
+    if (typeof h === 'string' && h) extractClassNamesFromHtml(h).forEach(c => allClassNames.add(c));
+  }
+  for (const value of Object.values(structureComponents)) {
+    if (Array.isArray(value)) {
+      // sections[] — each entry has { html, ... }
+      for (const item of value) if (item && typeof item === 'object') ingestHtml(item.html);
+    } else {
+      ingestHtml(value);
+    }
+  }
   if (allClassNames.size === 0) return {};
 
   const SKIP_VALUES = new Set(['', 'none', 'normal', 'auto', 'initial', 'unset', 'inherit', '0px', 'rgba(0, 0, 0, 0)', 'transparent']);
